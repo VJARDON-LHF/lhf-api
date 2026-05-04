@@ -11,7 +11,8 @@ const config = {
   database: 'lhf-movement',
   user: 'lhfreportsuser',
   password: 'LHFr3@d0nly',
-  options: { encrypt: true }
+  options: { encrypt: true },
+  requestTimeout: 300000 // 5 minutes
 };
 
 let cachedData = [];
