@@ -1,6 +1,7 @@
 const express = require('express');
 const sql = require('mssql');
 const cors = require('cors');
+const cron = require('node-cron');
 
 const app = express();
 app.use(cors());
@@ -13,7 +14,11 @@ const config = {
   options: { encrypt: true }
 };
 
-app.get('/sales', async (req, res) => {
+let cachedData = [];
+let lastUpdated = null;
+
+async function refreshData() {
+  console.log('Refreshing data...');
   try {
     const pool = await sql.connect(config);
     const result = await pool.request().query(`
@@ -35,10 +40,35 @@ app.get('/sales', async (req, res) => {
         od.Name
       ORDER BY WeekStart DESC, oh.StoreName, od.Upc
     `);
-    res.json(result.recordset);
+    cachedData = result.recordset;
+    lastUpdated = new Date();
+    console.log(`Data refreshed at ${lastUpdated} — ${cachedData.length} rows`);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Refresh failed:', err.message);
   }
+}
+
+// Refresh every Sunday at 1am
+cron.schedule('0 1 * * 0', refreshData);
+
+// Endpoint — instant response from cache
+app.get('/sales', (req, res) => {
+  res.json({
+    lastUpdated,
+    data: cachedData
+  });
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('API running'));
+// Status check
+app.get('/status', (req, res) => {
+  res.json({
+    lastUpdated,
+    totalRows: cachedData.length,
+    status: cachedData.length > 0 ? 'ready' : 'loading'
+  });
+});
+
+// Load data on startup then start server
+refreshData().then(() => {
+  app.listen(process.env.PORT || 3000, () => console.log('API running'));
+});
