@@ -1,158 +1,43 @@
 const express = require('express');
 const sql = require('mssql');
 const cors = require('cors');
-const axios = require('axios');
-const qs = require('querystring');
+const cron = require('node-cron');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
-// ─── Azure SQL Config ───────────────────────────────────────────────
-const dbConfig = {
-  server: 'lhf-mov.database.windows.net',
-  database: 'lhf-movement',
-  user: 'lhfreportsuser',
-  password: 'LHFr3@d0nly',
-  options: { encrypt: true }
+const config = {
+  server: process.env.DB_SERVER,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  options: { encrypt: true },
+  requestTimeout: 300000 // 5 minutes
 };
 
-// ─── QBO Config ─────────────────────────────────────────────────────
-const QBO_CLIENT_ID     = process.env.QBO_CLIENT_ID;
-const QBO_CLIENT_SECRET = process.env.QBO_CLIENT_SECRET;
-const QBO_REDIRECT_URI  = process.env.QBO_REDIRECT_URI;
-const QBO_REALM_ID      = process.env.QBO_REALM_ID;
-const QBO_BASE_URL      = 'https://quickbooks.api.intuit.com/v3/company';
+let cachedData = [];
+let lastUpdated = null;
 
-// In-memory token store (persists as long as Railway is running)
-let qboTokens = {
-  access_token: null,
-  refresh_token: null,
-  expires_at: null
-};
-
-// ─── QBO Auth Routes ────────────────────────────────────────────────
-
-// Step 1: Start OAuth flow — visit this URL in your browser once
-app.get('/qbo/auth', (req, res) => {
-  const scopes = 'com.intuit.quickbooks.accounting';
-  const authUrl = `https://appcenter.intuit.com/connect/oauth2?` +
-    `client_id=${QBO_CLIENT_ID}` +
-    `&redirect_uri=${encodeURIComponent(QBO_REDIRECT_URI)}` +
-    `&response_type=code` +
-    `&scope=${encodeURIComponent(scopes)}` +
-    `&state=randomstate123`;
-  res.redirect(authUrl);
-});
-
-// Step 2: Intuit redirects here with the auth code
-app.get('/qbo/callback', async (req, res) => {
-  const { code } = req.query;
-  try {
-    const response = await axios.post(
-      'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
-      qs.stringify({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: QBO_REDIRECT_URI
-      }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': 'Basic ' + Buffer.from(`${QBO_CLIENT_ID}:${QBO_CLIENT_SECRET}`).toString('base64')
-        }
-      }
-    );
-    qboTokens.access_token  = response.data.access_token;
-    qboTokens.refresh_token = response.data.refresh_token;
-    qboTokens.expires_at    = Date.now() + (response.data.expires_in * 1000);
-    res.send('✅ QuickBooks connected! You can close this tab.');
-  } catch (err) {
-    res.status(500).send('Auth failed: ' + err.message);
+// Build the connection pool once and reuse it.
+let pool;
+async function getPool() {
+  if (!pool) {
+    pool = await new sql.ConnectionPool(config).connect();
+    pool.on('error', (err) => {
+      console.error('Pool error:', err.message);
+      pool = null; // force a rebuild on next call
+    });
   }
-});
-
-// Auto-refresh access token when expired
-async function getValidToken() {
-  if (!qboTokens.refresh_token) throw new Error('Not authenticated. Visit /qbo/auth first.');
-  if (Date.now() < qboTokens.expires_at - 60000) return qboTokens.access_token;
-
-  const response = await axios.post(
-    'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
-    qs.stringify({ grant_type: 'refresh_token', refresh_token: qboTokens.refresh_token }),
-    {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': 'Basic ' + Buffer.from(`${QBO_CLIENT_ID}:${QBO_CLIENT_SECRET}`).toString('base64')
-      }
-    }
-  );
-  qboTokens.access_token  = response.data.access_token;
-  qboTokens.refresh_token = response.data.refresh_token;
-  qboTokens.expires_at    = Date.now() + (response.data.expires_in * 1000);
-  return qboTokens.access_token;
+  return pool;
 }
 
-// ─── QBO Data Routes ────────────────────────────────────────────────
-
-// Profit & Loss report
-app.get('/qbo/profit-loss', async (req, res) => {
+async function refreshData() {
+  console.log('Refreshing data...');
   try {
-    const token = await getValidToken();
-    const { start_date = '2024-01-01', end_date = '2024-12-31' } = req.query;
-    const response = await axios.get(
-      `${QBO_BASE_URL}/${QBO_REALM_ID}/reports/ProfitAndLoss?start_date=${start_date}&end_date=${end_date}&summarize_column_by=Month`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Invoices / Sales
-app.get('/qbo/invoices', async (req, res) => {
-  try {
-    const token = await getValidToken();
-    const response = await axios.get(
-      `${QBO_BASE_URL}/${QBO_REALM_ID}/query?query=SELECT * FROM Invoice ORDER BY TxnDate DESC MAXRESULTS 100`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    res.json(response.data.QueryResponse.Invoice || []);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Expenses
-app.get('/qbo/expenses', async (req, res) => {
-  try {
-    const token = await getValidToken();
-    const response = await axios.get(
-      `${QBO_BASE_URL}/${QBO_REALM_ID}/query?query=SELECT * FROM Purchase ORDER BY TxnDate DESC MAXRESULTS 100`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-    );
-    res.json(response.data.QueryResponse.Purchase || []);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Auth status check
-app.get('/qbo/status', (req, res) => {
-  res.json({
-    connected: !!qboTokens.access_token,
-    expires_at: qboTokens.expires_at ? new Date(qboTokens.expires_at).toISOString() : null
-  });
-});
-
-// ─── Existing POS/Azure Route ────────────────────────────────────────
-app.get('/sales', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig);
-    const result = await pool.request().query(`
-      SELECT 
-        DATEADD(DAY, -(DATEPART(WEEKDAY, oh.DispatchDate)-1), CAST(oh.DispatchDate AS DATE)) AS WeekStart,
+    const p = await getPool();
+    const result = await p.request().query(`
+      SELECT
+        CAST(oh.DispatchDate AS DATE) AS SaleDate,
         oh.StoreName,
         od.Upc AS SKU,
         od.Name AS ProductName,
@@ -162,17 +47,57 @@ app.get('/sales', async (req, res) => {
       INNER JOIN OrderDetails od ON oh.Id = od.OrderId
       WHERE od.Brand = 'La Hacienda'
         AND oh.DispatchDate >= DATEADD(WEEK, -52, GETDATE())
-      GROUP BY 
-        DATEADD(DAY, -(DATEPART(WEEKDAY, oh.DispatchDate)-1), CAST(oh.DispatchDate AS DATE)),
-        oh.StoreName, od.Upc, od.Name
-      ORDER BY WeekStart DESC, oh.StoreName, od.Upc
+      GROUP BY
+        CAST(oh.DispatchDate AS DATE),
+        oh.StoreName,
+        od.Upc,
+        od.Name
+      ORDER BY SaleDate DESC, oh.StoreName, od.Upc
     `);
-    res.json(result.recordset);
+    cachedData = result.recordset;
+    lastUpdated = new Date();
+    console.log(`Data refreshed at ${lastUpdated} — ${cachedData.length} rows`);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Refresh failed:', err.message);
   }
+}
+
+// Refresh every day at 1am, pinned to local timezone.
+cron.schedule('0 1 * * *', refreshData, { timezone: 'America/Puerto_Rico' });
+
+// Simple bearer-token gate. If API_TOKEN isn't set, the route stays open
+// (handy for local dev) but logs a warning so it's not a silent hole.
+function requireToken(req, res, next) {
+  const expected = process.env.API_TOKEN;
+  if (!expected) {
+    console.warn('API_TOKEN not set — /sales is unauthenticated');
+    return next();
+  }
+  const provided = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (provided !== expected) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// Endpoint — instant response from cache
+app.get('/sales', requireToken, (req, res) => {
+  res.json({
+    lastUpdated,
+    data: cachedData
+  });
 });
 
-app.get('/status', (req, res) => res.json({ status: 'ok' }));
+// Status check (left open — exposes only row count + timestamp)
+app.get('/status', (req, res) => {
+  res.json({
+    lastUpdated,
+    totalRows: cachedData.length,
+    status: cachedData.length > 0 ? 'ready' : 'loading'
+  });
+});
 
-app.listen(process.env.PORT || 3000, () => console.log('API running'));
+// Load data on startup then start server
+refreshData().then(() => {
+  app.listen(process.env.PORT || 3000, () => console.log('API running'));
+});
