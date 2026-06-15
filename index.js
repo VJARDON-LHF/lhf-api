@@ -46,7 +46,7 @@ async function refreshData() {
       FROM OrderHeaders oh
       INNER JOIN OrderDetails od ON oh.Id = od.OrderId
       WHERE od.Brand = 'La Hacienda'
-        AND oh.DispatchDate >= DATEADD(WEEK, -52, GETDATE())
+        AND oh.DispatchDate >= DATEADD(WEEK, -56, GETDATE())
       GROUP BY
         CAST(oh.DispatchDate AS DATE),
         oh.StoreName,
