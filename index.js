@@ -45,8 +45,7 @@ async function refreshData() {
         SUM(od.Price * od.Quantity) AS TotalRevenue
       FROM OrderHeaders oh
       INNER JOIN OrderDetails od ON oh.Id = od.OrderId
-      WHERE od.Brand = 'La Hacienda'
-        AND oh.DispatchDate >= DATEADD(WEEK, -56, GETDATE())
+      WHERE oh.DispatchDate >= DATEADD(WEEK, -56, GETDATE())
       GROUP BY
         CAST(oh.DispatchDate AS DATE),
         oh.StoreName,
