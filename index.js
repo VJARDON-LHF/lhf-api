@@ -12,26 +12,43 @@ const config = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   options: { encrypt: true },
-  requestTimeout: 300000 // 5 minutes
+  connectionTimeout: 30000,  // fail fast if the host is unreachable
+  requestTimeout: 300000     // 5 minutes — the aggregate query is slow
 };
 
 let cachedData = [];
 let lastUpdated = null;
+let lastError = null;
+let refreshing = false;
 
 // Build the connection pool once and reuse it.
 let pool;
 async function getPool() {
   if (!pool) {
-    pool = await new sql.ConnectionPool(config).connect();
-    pool.on('error', (err) => {
+    const p = new sql.ConnectionPool(config);
+    p.on('error', (err) => {
       console.error('Pool error:', err.message);
       pool = null; // force a rebuild on next call
     });
+    try {
+      pool = await p.connect();
+    } catch (err) {
+      pool = null; // never cache a half-open pool
+      throw err;
+    }
   }
   return pool;
 }
 
 async function refreshData() {
+  // Startup and cron can both fire; don't stack two 5-minute queries.
+  if (refreshing) {
+    console.log('Refresh already in progress — skipping.');
+    return;
+  }
+  refreshing = true;
+
+  const startedAt = Date.now();
   console.log('Refreshing data...');
   try {
     const p = await getPool();
@@ -39,6 +56,7 @@ async function refreshData() {
       SELECT
         CAST(oh.DispatchDate AS DATE) AS SaleDate,
         oh.StoreName,
+        od.Brand,
         od.Upc AS SKU,
         od.Name AS ProductName,
         SUM(od.Quantity) AS TotalUnits,
@@ -49,15 +67,25 @@ async function refreshData() {
       GROUP BY
         CAST(oh.DispatchDate AS DATE),
         oh.StoreName,
+        od.Brand,
         od.Upc,
         od.Name
       ORDER BY SaleDate DESC, oh.StoreName, od.Upc
     `);
+
     cachedData = result.recordset;
     lastUpdated = new Date();
-    console.log(`Data refreshed at ${lastUpdated} — ${cachedData.length} rows`);
+    lastError = null;
+    const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+    console.log(
+      `Data refreshed at ${lastUpdated.toISOString()} — ${cachedData.length} rows in ${secs}s`
+    );
   } catch (err) {
-    console.error('Refresh failed:', err.message);
+    // Keep the previous cache rather than blanking it out on a failed refresh.
+    lastError = { message: err.message, code: err.code, at: new Date().toISOString() };
+    console.error('Refresh failed:', err.code || '', err.message);
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -81,22 +109,46 @@ function requireToken(req, res, next) {
 
 // Endpoint — instant response from cache
 app.get('/sales', requireToken, (req, res) => {
-  res.json({
-    lastUpdated,
-    data: cachedData
-  });
+  if (!lastUpdated) {
+    return res.status(503).json({
+      error: 'Cache not populated yet',
+      refreshing,
+      lastError: lastError && lastError.message
+    });
+  }
+  res.json({ lastUpdated, data: cachedData });
 });
 
-// Status check (left open — exposes only row count + timestamp)
+// Status check (left open — exposes only row count + timestamps)
 app.get('/status', (req, res) => {
   res.json({
+    status: cachedData.length > 0 ? 'ready' : (refreshing ? 'loading' : 'empty'),
     lastUpdated,
     totalRows: cachedData.length,
-    status: cachedData.length > 0 ? 'ready' : 'loading'
+    refreshing,
+    lastError
   });
 });
 
-// Load data on startup then start server
-refreshData().then(() => {
-  app.listen(process.env.PORT || 3000, () => console.log('API running'));
+// Health check — always 200, never touches the DB. Point Railway here.
+app.get('/health', (req, res) => res.status(200).send('ok'));
+
+// Manual refresh trigger (token-gated), so you don't have to redeploy to retry.
+app.post('/refresh', requireToken, (req, res) => {
+  if (refreshing) return res.status(409).json({ error: 'Refresh already in progress' });
+  refreshData();
+  res.status(202).json({ started: true });
+});
+
+// Bind the port FIRST, then load data in the background. Otherwise the
+// platform health check hits a dead port for up to 5 minutes and restarts us.
+const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0', () => {
+  console.log(`API running on port ${port}`);
+  refreshData();
+});
+
+// Don't let an unhandled rejection take the process down silently.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err && err.message);
 });
